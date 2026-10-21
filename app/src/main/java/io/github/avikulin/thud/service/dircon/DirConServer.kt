@@ -96,6 +96,7 @@ class DirConServer(
         private const val SERVICE_TYPE = "_wahoo-fitness-tnp._tcp."
         private const val DEFAULT_PORT = 36866
         private const val NOTIFICATION_INTERVAL_MS = 250L  // 4 Hz update rate
+        private const val MAX_CLIENTS = 8
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -105,6 +106,8 @@ class DirConServer(
 
     private val isRunning = AtomicBoolean(false)
     private val clients = ConcurrentHashMap.newKeySet<ClientHandler>()
+    private val connectionSlots = DirConConnectionSlots(MAX_CLIENTS)
+    private val clientLifecycle = Any()
     private val controlAuthorization = FtmsControlAuthorization<ClientHandler>(controlAllowed)
     private var notificationJob: Job? = null
 
@@ -115,7 +118,7 @@ class DirConServer(
     /**
      * Start the DirCon server.
      */
-    fun start(): Boolean {
+    @Synchronized fun start(): Boolean {
         if (isRunning.get()) {
             Log.w(TAG, "Server already running")
             return true
@@ -123,7 +126,8 @@ class DirConServer(
 
         try {
             // Start TCP server
-            serverSocket = ServerSocket(DEFAULT_PORT)
+            val listeningSocket = ServerSocket(DEFAULT_PORT)
+            serverSocket = listeningSocket
             Log.d(TAG, "TCP server started on port $DEFAULT_PORT")
 
             controlAuthorization.start()
@@ -131,7 +135,7 @@ class DirConServer(
 
             // Accept connections in background
             scope.launch {
-                acceptConnections()
+                acceptConnections(listeningSocket)
             }
 
             // Start mDNS advertisement
@@ -152,8 +156,12 @@ class DirConServer(
     /**
      * Stop the DirCon server.
      */
-    fun stop() {
-        if (!isRunning.getAndSet(false)) return
+    @Synchronized fun stop() {
+        synchronized(clientLifecycle) {
+            if (!isRunning.getAndSet(false)) return
+            clients.forEach { it.close() }
+            // Slots remain occupied until each handler job has actually completed.
+        }
 
         Log.d(TAG, "Stopping DirCon server")
         controlAuthorization.clear()
@@ -164,10 +172,6 @@ class DirConServer(
 
         // Stop mDNS
         stopMdnsAdvertisement()
-
-        // Close all client connections
-        clients.forEach { it.close() }
-        clients.clear()
 
         // Close server socket
         try {
@@ -192,30 +196,63 @@ class DirConServer(
 
     // ==================== TCP Server ====================
 
-    private suspend fun acceptConnections() {
-        while (isRunning.get()) {
+    private suspend fun acceptConnections(listenerSocket: ServerSocket) {
+        while (isRunning.get() && serverSocket === listenerSocket) {
             try {
-                val socket = serverSocket?.accept() ?: break
-                if (!isRunning.get()) {
-                    socket.close()
-                    break
-                }
+                val socket = listenerSocket.accept()
                 val clientAddress = socket.inetAddress.hostAddress ?: "unknown"
+
+                val admitted = synchronized(clientLifecycle) {
+                    if (!isRunning.get() || serverSocket !== listenerSocket) {
+                        socket.close() // Reject before streams, buffers, writer or handler job allocation.
+                        null
+                    } else {
+                        val lease = connectionSlots.acquire(socket) ?: return@synchronized null
+                        try {
+                            ClientHandler(socket, this).also {
+                                clients.add(it)
+                                controlAuthorization.connected(it)
+                            } to lease
+                        } catch (e: Exception) {
+                            try {
+                                socket.close()
+                            } finally {
+                                lease.close()
+                            }
+                            throw e
+                        }
+                    }
+                } ?: continue
+                val (handler, lease) = admitted
                 Log.i(TAG, "Client connected: $clientAddress")
 
-                val handler = ClientHandler(socket, this)
-                clients.add(handler)
-                controlAuthorization.connected(handler)
-
-                scope.launch {
+                val job = scope.launch {
                     try {
                         listener.onClientConnected(clientAddress)
                         handler.run()
                     } finally {
-                        controlAuthorization.disconnected(handler)
-                        clients.remove(handler)
                         listener.onClientDisconnected(clientAddress)
                         Log.i(TAG, "Client disconnected: $clientAddress")
+                    }
+                }
+                // Completion also runs when cancellation prevents the coroutine body from starting.
+                job.invokeOnCompletion {
+                    handler.close()
+                    // Retain the slot if teardown ever fails to stop the writer: fail closed.
+                    val writerStopped = try {
+                        handler.awaitWriterTermination()
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        false
+                    }
+                    synchronized(clientLifecycle) {
+                        controlAuthorization.disconnected(handler)
+                        if (writerStopped) {
+                            clients.remove(handler)
+                            lease.close()
+                        } else {
+                            Log.e(TAG, "Retaining client slot: writer termination unconfirmed")
+                        }
                     }
                 }
             } catch (e: IOException) {

@@ -19,6 +19,9 @@ data class DirConPacket(
 ) {
     companion object {
         const val HEADER_SIZE = 6
+        // The protocol carries an unsigned 16-bit payload length.
+        const val MAX_PAYLOAD_SIZE = 0xFFFF
+        const val MAX_FRAME_SIZE = HEADER_SIZE + MAX_PAYLOAD_SIZE
         const val MESSAGE_VERSION = 0x01
 
         // Message types
@@ -51,27 +54,32 @@ data class DirConPacket(
 
         /**
          * Parse a packet from raw bytes.
-         * Returns null if data is incomplete.
+         * Returns null only if data is incomplete; rejects malformed versions/ranges.
          */
-        fun parse(data: ByteArray, offset: Int = 0): DirConPacket? {
-            if (data.size - offset < HEADER_SIZE) return null
+        fun parse(data: ByteArray, offset: Int = 0, length: Int = data.size - offset): DirConPacket? {
+            val frameSize = frameSize(data, offset, length) ?: return null
+            if (length < frameSize) return null
 
             val version = data[offset].toInt() and 0xFF
             val identifier = data[offset + 1].toInt() and 0xFF
             val seqNum = data[offset + 2].toInt() and 0xFF
             val respCode = data[offset + 3].toInt() and 0xFF
-            val length = ((data[offset + 4].toInt() and 0xFF) shl 8) or
-                         (data[offset + 5].toInt() and 0xFF)
-
-            if (data.size - offset < HEADER_SIZE + length) return null
-
-            val payload = if (length > 0) {
-                data.copyOfRange(offset + HEADER_SIZE, offset + HEADER_SIZE + length)
-            } else {
-                ByteArray(0)
-            }
-
+            val payload = data.copyOfRange(offset + HEADER_SIZE, offset + frameSize)
             return DirConPacket(version, identifier, seqNum, respCode, payload)
+        }
+
+        /** Validate the available header and return its bounded declared frame size. */
+        internal fun frameSize(data: ByteArray, offset: Int = 0, length: Int = data.size - offset): Int? {
+            require(offset >= 0 && offset <= data.size && length >= 0 && length <= data.size - offset)
+            if (length == 0) return null
+            if (data[offset].toInt() != MESSAGE_VERSION) {
+                throw java.net.ProtocolException("Unsupported DirCon version")
+            }
+            if (length < HEADER_SIZE) return null
+
+            val payloadLength = ((data[offset + 4].toInt() and 0xFF) shl 8) or
+                         (data[offset + 5].toInt() and 0xFF)
+            return HEADER_SIZE + payloadLength
         }
 
         /**
@@ -115,6 +123,7 @@ data class DirConPacket(
      * Encode packet to bytes for transmission.
      */
     fun encode(): ByteArray {
+        require(payload.size <= MAX_PAYLOAD_SIZE) { "DirCon payload exceeds wire length" }
         val data = ByteArray(HEADER_SIZE + payload.size)
         data[0] = messageVersion.toByte()
         data[1] = identifier.toByte()
