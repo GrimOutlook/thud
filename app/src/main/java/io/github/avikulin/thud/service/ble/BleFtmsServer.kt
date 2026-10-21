@@ -10,10 +10,10 @@ import android.content.Context
 import android.os.ParcelUuid
 import android.util.Log
 import io.github.avikulin.thud.service.dircon.FtmsCharacteristics
+import io.github.avikulin.thud.service.ftms.FtmsControlAuthorization
 import kotlinx.coroutines.*
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicReference
 
 /**
  * BLE FTMS (Fitness Machine Service) server for fitness app connectivity.
@@ -148,8 +148,7 @@ class BleFtmsServer(
     private val connectedDevices = ConcurrentHashMap<String, BluetoothDevice>()
     private val notificationSubscriptions = ConcurrentHashMap<String, MutableSet<UUID>>()
 
-    // Track which device has control (atomic for thread safety across GATT callbacks)
-    private val controllingDevice = AtomicReference<String?>(null)
+    private val controlAuthorization = FtmsControlAuthorization<String>(controlAllowed)
 
     // Service addition queue (addService is async, must wait for callback)
     private val pendingServices = mutableListOf<BluetoothGattService>()
@@ -204,6 +203,7 @@ class BleFtmsServer(
             }
         }
 
+        controlAuthorization.start()
         isRunning = true
         Log.i(TAG, "BLE FTMS server starting (waiting for services to be added)...")
         return true
@@ -216,6 +216,7 @@ class BleFtmsServer(
         if (!isRunning) return
 
         isRunning = false
+        controlAuthorization.clear()
         servicesReady = false
         notificationJob?.cancel()
         notificationJob = null
@@ -229,7 +230,6 @@ class BleFtmsServer(
         connectedDevices.clear()
         notificationSubscriptions.clear()
         pendingServices.clear()
-        controllingDevice.set(null)
 
         gattServer?.close()
         gattServer = null
@@ -446,6 +446,7 @@ class BleFtmsServer(
                 BluetoothProfile.STATE_CONNECTED -> {
                     Log.i(TAG, "Client connected: $address")
                     connectedDevices[address] = device
+                    controlAuthorization.connected(address)
                     notificationSubscriptions[address] = mutableSetOf()
                     listener.onClientConnected(address)
                 }
@@ -453,7 +454,7 @@ class BleFtmsServer(
                     Log.i(TAG, "Client disconnected: $address (status=$status)")
                     connectedDevices.remove(address)
                     notificationSubscriptions.remove(address)
-                    controllingDevice.compareAndSet(address, null)
+                    controlAuthorization.disconnected(address)
                     listener.onClientDisconnected(address)
 
                     // Restart advertising if no clients connected (Android may have stopped it)
@@ -597,28 +598,22 @@ class BleFtmsServer(
         val command = FtmsCharacteristics.parseControlCommand(data)
         Log.d(TAG, "Parsed command: $command")
 
+        if (command == null) return FtmsCharacteristics.RESULT_INVALID_PARAMETER
+        return controlAuthorization.execute(
+            sender = deviceAddress,
+            requestControl = command is FtmsCharacteristics.ControlCommand.RequestControl,
+            reset = command is FtmsCharacteristics.ControlCommand.Reset,
+            approve = listener::onControlRequested
+        ) { dispatchControlCommand(command) } ?: FtmsCharacteristics.RESULT_CONTROL_NOT_PERMITTED
+    }
+
+    private fun dispatchControlCommand(command: FtmsCharacteristics.ControlCommand): Int {
         return when (command) {
             is FtmsCharacteristics.ControlCommand.RequestControl -> {
-                if (!controlAllowed) {
-                    Log.d(TAG, "Control request denied - control not allowed by settings")
-                    FtmsCharacteristics.RESULT_CONTROL_NOT_PERMITTED
-                } else {
-                    val current = controllingDevice.get()
-                    if (current == null || current == deviceAddress) {
-                        if (listener.onControlRequested()) {
-                            controllingDevice.compareAndSet(current, deviceAddress)
-                            FtmsCharacteristics.RESULT_SUCCESS
-                        } else {
-                            FtmsCharacteristics.RESULT_CONTROL_NOT_PERMITTED
-                        }
-                    } else {
-                        FtmsCharacteristics.RESULT_CONTROL_NOT_PERMITTED
-                    }
-                }
+                FtmsCharacteristics.RESULT_SUCCESS
             }
 
             is FtmsCharacteristics.ControlCommand.Reset -> {
-                controllingDevice.set(null)
                 FtmsCharacteristics.RESULT_SUCCESS
             }
 
@@ -667,7 +662,6 @@ class BleFtmsServer(
                 FtmsCharacteristics.RESULT_NOT_SUPPORTED
             }
 
-            null -> FtmsCharacteristics.RESULT_INVALID_PARAMETER
         }
     }
 

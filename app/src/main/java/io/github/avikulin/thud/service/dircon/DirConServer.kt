@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.util.Log
+import io.github.avikulin.thud.service.ftms.FtmsControlAuthorization
 import kotlinx.coroutines.*
 import java.io.IOException
 import java.net.InetAddress
@@ -103,7 +104,8 @@ class DirConServer(
     private var registrationListener: NsdManager.RegistrationListener? = null
 
     private val isRunning = AtomicBoolean(false)
-    private val clients = ConcurrentHashMap<String, ClientHandler>()
+    private val clients = ConcurrentHashMap.newKeySet<ClientHandler>()
+    private val controlAuthorization = FtmsControlAuthorization<ClientHandler>(controlAllowed)
     private var notificationJob: Job? = null
 
     // Device identification
@@ -124,6 +126,7 @@ class DirConServer(
             serverSocket = ServerSocket(DEFAULT_PORT)
             Log.d(TAG, "TCP server started on port $DEFAULT_PORT")
 
+            controlAuthorization.start()
             isRunning.set(true)
 
             // Accept connections in background
@@ -153,6 +156,7 @@ class DirConServer(
         if (!isRunning.getAndSet(false)) return
 
         Log.d(TAG, "Stopping DirCon server")
+        controlAuthorization.clear()
 
         // Stop notification loop
         notificationJob?.cancel()
@@ -162,7 +166,7 @@ class DirConServer(
         stopMdnsAdvertisement()
 
         // Close all client connections
-        clients.values.forEach { it.close() }
+        clients.forEach { it.close() }
         clients.clear()
 
         // Close server socket
@@ -192,18 +196,24 @@ class DirConServer(
         while (isRunning.get()) {
             try {
                 val socket = serverSocket?.accept() ?: break
+                if (!isRunning.get()) {
+                    socket.close()
+                    break
+                }
                 val clientAddress = socket.inetAddress.hostAddress ?: "unknown"
                 Log.i(TAG, "Client connected: $clientAddress")
 
                 val handler = ClientHandler(socket, this)
-                clients[clientAddress] = handler
+                clients.add(handler)
+                controlAuthorization.connected(handler)
 
                 scope.launch {
                     try {
                         listener.onClientConnected(clientAddress)
                         handler.run()
                     } finally {
-                        clients.remove(clientAddress)
+                        controlAuthorization.disconnected(handler)
+                        clients.remove(handler)
                         listener.onClientDisconnected(clientAddress)
                         Log.i(TAG, "Client disconnected: $clientAddress")
                     }
@@ -317,7 +327,7 @@ class DirConServer(
         )
 
         // Send to all clients that have enabled notifications
-        clients.values.forEach { client ->
+        clients.forEach { client ->
             client.sendNotificationIfEnabled(
                 FtmsCharacteristics.CHAR_TREADMILL_DATA,
                 treadmillData
@@ -470,17 +480,18 @@ class DirConServer(
             return FtmsCharacteristics.RESULT_INVALID_PARAMETER
         }
 
+        return controlAuthorization.execute(
+            sender = client,
+            requestControl = command is FtmsCharacteristics.ControlCommand.RequestControl,
+            reset = command is FtmsCharacteristics.ControlCommand.Reset,
+            approve = listener::onControlRequested
+        ) { dispatchControlCommand(command) } ?: FtmsCharacteristics.RESULT_CONTROL_NOT_PERMITTED
+    }
+
+    private fun dispatchControlCommand(command: FtmsCharacteristics.ControlCommand): Int {
         return when (command) {
             is FtmsCharacteristics.ControlCommand.RequestControl -> {
-                if (!controlAllowed) {
-                    Log.d(TAG, "Control request denied - control not allowed by settings")
-                    FtmsCharacteristics.RESULT_CONTROL_NOT_PERMITTED
-                } else if (listener.onControlRequested()) {
-                    client.hasControl = true
-                    FtmsCharacteristics.RESULT_SUCCESS
-                } else {
-                    FtmsCharacteristics.RESULT_CONTROL_NOT_PERMITTED
-                }
+                FtmsCharacteristics.RESULT_SUCCESS
             }
 
             is FtmsCharacteristics.ControlCommand.Reset -> {
