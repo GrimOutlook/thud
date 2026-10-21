@@ -194,10 +194,15 @@ class TelemetryManager(
      * Updates [ServiceStateHolder.targetAdjustedSpeedKph] for stable display/recording.
      */
     fun setTreadmillSpeed(adjustedKph: Double): Boolean {
-        state.targetAdjustedSpeedKph = adjustedKph
-        val treadmillKph = state.adjustedToRawSpeed(adjustedKph, state.currentRawInclinePercent)
-        lastCommandedRawSpeed = treadmillKph
-        val success = glassOsClient?.setSpeed(treadmillKph) ?: false
+        val client = glassOsClient ?: return false
+        val treadmillKph = RawCommandPlanner.speed(adjustedKph,
+            { state.adjustedToRawSpeed(it, state.currentRawInclinePercent) },
+            client::canSetSpeed) ?: return false
+        val success = client.setSpeed(treadmillKph)
+        if (success) {
+            state.targetAdjustedSpeedKph = adjustedKph
+            lastCommandedRawSpeed = treadmillKph
+        }
         Log.d(TAG, "Set speed: $adjustedKph kph (adjusted) -> $treadmillKph kph (treadmill): $success")
         return success
     }
@@ -215,50 +220,24 @@ class TelemetryManager(
      * @param effectivePercent The effective incline (0% = flat outdoor equivalent)
      */
     fun setTreadmillIncline(effectivePercent: Double): Boolean {
-        val newTreadmillPercent = effectivePercent + state.inclineAdjustment
-        val success = glassOsClient?.setIncline(newTreadmillPercent) ?: false
-        compensateSpeedForInclineChange(newTreadmillPercent)
+        val client = glassOsClient ?: return false
+        // Preflight compensation before changing incline: an invalid final speed must
+        // not leave the treadmill at an incline where the target cannot be maintained.
+        val plan = RawCommandPlanner.incline(effectivePercent, state.inclineAdjustment,
+            state.targetAdjustedSpeedKph.takeIf { state.speedCalibrationAuto },
+            { target, incline -> state.adjustedToRawSpeed(target, incline) },
+            client::canSetIncline, client::canSetSpeed) ?: return false
+        val newTreadmillPercent = plan.rawPercent
+        val compensatedSpeed = plan.compensatedRawSpeed
+        val success = client.setIncline(newTreadmillPercent)
+        if (success && compensatedSpeed != null &&
+            kotlin.math.abs(compensatedSpeed - state.currentSpeedKph) > 0.01) {
+            // The RPC boundary revalidates; only track a command accepted by it.
+            if (!client.setSpeed(compensatedSpeed)) return false
+            lastCommandedRawSpeed = compensatedSpeed
+        }
         Log.d(TAG, "Set incline: effective=$effectivePercent%, treadmill=$newTreadmillPercent%: $success")
         return success
-    }
-
-    /**
-     * If auto-calibration is active and the belt is running, re-send the raw speed
-     * needed to maintain [targetAdjustedSpeedKph] at [newRawInclinePercent].
-     *
-     * Does NOT modify [targetAdjustedSpeedKph] — the target stays the same,
-     * only the raw speed to achieve it changes with incline.
-     *
-     * Only called from [setTreadmillIncline] (software-initiated incline changes).
-     * NOT called from onInclineUpdate — reacting to every telemetry tick during incline
-     * transitions creates oscillation (incline bounces between old/new while motor adjusts).
-     */
-    private fun compensateSpeedForInclineChange(newRawInclinePercent: Double) {
-        if (!state.speedCalibrationAuto) {
-            Log.d(TAG, "Incline compensation SKIPPED: auto calibration disabled")
-            return
-        }
-        if (state.targetAdjustedSpeedKph <= 0) {
-            Log.d(TAG, "Incline compensation SKIPPED: targetAdjustedSpeed=${state.targetAdjustedSpeedKph}")
-            return
-        }
-
-        val oldRawIncline = state.currentRawInclinePercent
-        val newRawSpeedKph = state.adjustedToRawSpeed(state.targetAdjustedSpeedKph, newRawInclinePercent)
-        val delta = kotlin.math.abs(newRawSpeedKph - state.currentSpeedKph)
-
-        Log.d(TAG, "Incline compensation: target=${state.targetAdjustedSpeedKph} kph, " +
-            "oldIncline=$oldRawIncline%, newIncline=$newRawInclinePercent%, " +
-            "currentRaw=${state.currentSpeedKph}, newRaw=$newRawSpeedKph, delta=$delta")
-
-        if (delta > 0.01) {
-            lastCommandedRawSpeed = newRawSpeedKph
-            glassOsClient?.setSpeed(newRawSpeedKph)
-            Log.d(TAG, "Incline compensation APPLIED: raw speed ${state.currentSpeedKph} -> $newRawSpeedKph kph " +
-                "to maintain adjusted ${state.targetAdjustedSpeedKph} kph (incline -> $newRawInclinePercent%)")
-        } else {
-            Log.d(TAG, "Incline compensation NOT NEEDED: delta=$delta <= 0.01")
-        }
     }
 
     /**

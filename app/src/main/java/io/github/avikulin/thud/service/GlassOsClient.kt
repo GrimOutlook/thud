@@ -207,6 +207,9 @@ class GlassOsClient(
     private var currentLockoutState: IdleModeLockoutState = IdleModeLockoutState.LOCK_STATE_UNKNOWN
 
     // Cached console info (min/max ranges)
+    @Volatile private var speedCommandLimits: RawCommandLimits? = null
+    @Volatile private var inclineCommandLimits: RawCommandLimits? = null
+
     var minSpeedKph: Double = 1.6  // Default ~1 mph
         private set
     var maxSpeedKph: Double = 20.0
@@ -245,6 +248,8 @@ class GlassOsClient(
      * @throws CertificatesNotFoundError if mTLS certificates are not installed
      */
     fun connect(): Boolean {
+        speedCommandLimits = null
+        inclineCommandLimits = null
         return try {
             Log.d(TAG, "Connecting to GlassOS at $host:$port with mTLS")
 
@@ -306,6 +311,8 @@ class GlassOsClient(
     }
 
     fun disconnect() {
+        speedCommandLimits = null
+        inclineCommandLimits = null
         try {
             channel?.shutdown()?.awaitTermination(5, TimeUnit.SECONDS)
             channel = null
@@ -466,7 +473,15 @@ class GlassOsClient(
 
     // ==================== Control Commands ====================
 
+    fun canSetSpeed(kph: Double): Boolean = RawCommandLimits.acceptsSpeed(kph, speedCommandLimits)
+
+    fun canSetIncline(percent: Double): Boolean = inclineCommandLimits?.accepts(percent) == true
+
     fun setSpeed(kph: Double): Boolean {
+        if (!canSetSpeed(kph)) {
+            Log.w(TAG, "Rejected raw speed: $kph (unsupported or outside discovered limits)")
+            return false
+        }
         return try {
             val request = SpeedRequest.newBuilder().setKph(kph).build()
             val result = speedBlockingStub?.setSpeed(request)
@@ -481,6 +496,10 @@ class GlassOsClient(
     }
 
     fun setIncline(percent: Double): Boolean {
+        if (!canSetIncline(percent)) {
+            Log.w(TAG, "Rejected raw incline: $percent (unsupported or outside discovered limits)")
+            return false
+        }
         return try {
             val request = InclineRequest.newBuilder().setPercent(percent).build()
             val result = inclineBlockingStub?.setIncline(request)
@@ -634,6 +653,8 @@ class GlassOsClient(
     // ==================== Console Info ====================
 
     private fun queryConsoleInfo() {
+        speedCommandLimits = null
+        inclineCommandLimits = null
         try {
             val empty = Empty.getDefaultInstance()
             val consoleInfo = consoleBlockingStub?.getConsole(empty)
@@ -642,6 +663,12 @@ class GlassOsClient(
                 maxSpeedKph = consoleInfo.maxKph
                 minInclinePercent = consoleInfo.minInclinePercent
                 maxInclinePercent = consoleInfo.maxInclinePercent
+                if (consoleInfo.canSetSpeed) {
+                    speedCommandLimits = RawCommandLimits(minSpeedKph, maxSpeedKph)
+                }
+                if (consoleInfo.canSetIncline) {
+                    inclineCommandLimits = RawCommandLimits(minInclinePercent, maxInclinePercent)
+                }
                 treadmillName = consoleInfo.name ?: ""
 
                 Log.d(TAG, "Console info: name='$treadmillName', speed=${minSpeedKph}-${maxSpeedKph} kph, " +
@@ -649,7 +676,7 @@ class GlassOsClient(
             }
         } catch (e: Exception) {
             Log.e(TAG, "QueryConsoleInfo failed: ${e.message}")
-            // Keep default values
+            // Display defaults may remain, but command limits stay unavailable (fail closed).
         }
     }
 
