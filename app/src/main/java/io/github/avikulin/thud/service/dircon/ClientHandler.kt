@@ -3,7 +3,6 @@ package io.github.avikulin.thud.service.dircon
 import android.util.Log
 import java.io.IOException
 import java.io.InputStream
-import java.io.OutputStream
 import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
 
@@ -19,17 +18,16 @@ class ClientHandler(
     }
 
     private val input: InputStream = socket.getInputStream()
-    private val output: OutputStream = socket.getOutputStream()
     private val clientAddress: String = socket.inetAddress.hostAddress ?: "unknown"
 
     /** Characteristics with notifications enabled */
     val enabledNotifications = ConcurrentHashMap.newKeySet<Int>()
 
-    /** Whether this client has control permission */
-    @Volatile var hasControl = false
-
     @Volatile private var isClosed = false
     @Volatile private var lastActivityNanos = System.nanoTime()
+    private val writer = DirConSocketWriter(socket,
+        onClose = { isClosed = true },
+        onSent = { lastActivityNanos = System.nanoTime() })
 
     /**
      * Run the client handler loop.
@@ -60,23 +58,10 @@ class ClientHandler(
     /**
      * Send a packet to the client.
      */
-    @Synchronized
     fun sendPacket(packet: DirConPacket) {
         if (isClosed || socket.isClosed) return
 
-        try {
-            val data = packet.encode()
-            output.write(data)
-            output.flush()
-            lastActivityNanos = System.nanoTime()
-            // Only log non-notification packets to avoid flooding logcat
-            if (packet.identifier != DirConPacket.MSG_UNSOLICITED_NOTIFICATION) {
-                Log.d(TAG, "[$clientAddress] Sent: $packet")
-            }
-        } catch (e: IOException) {
-            Log.w(TAG, "[$clientAddress] Failed to send packet: ${e.message}")
-            close()
-        }
+        writer.send(packet.encode())
     }
 
     /**
@@ -102,13 +87,8 @@ class ClientHandler(
      * Close the client connection.
      */
     fun close() {
-        if (isClosed) return
-        isClosed = true
-
-        try {
-            socket.close()
-        } catch (e: Exception) {
-            // Ignore
-        }
+        writer.close()
     }
+
+    internal fun awaitWriterTermination(): Boolean = writer.awaitTermination(6_000)
 }
