@@ -12,11 +12,7 @@ import android.graphics.LinearGradient
 import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.Shader
-import android.graphics.drawable.BitmapDrawable
-import android.Manifest
-import android.content.pm.PackageManager
 import android.hardware.display.DisplayManager
-import androidx.core.content.ContextCompat
 import android.hardware.display.VirtualDisplay
 import android.media.ImageReader
 import android.media.MediaScannerConnection
@@ -438,52 +434,16 @@ class ScreenshotManager(
      * Cached for performance.
      *
      * Fallback order:
-     * 1. Actual wallpaper bitmap (requires READ_EXTERNAL_STORAGE on some devices)
-     * 2. Gradient based on WallpaperColors API (no permission needed, Android 8.1+)
-     * 3. Default dark gradient
+     * 1. Gradient based on WallpaperColors API (no storage permission needed)
+     * 2. Default dark gradient
      */
     private fun getWallpaperBitmap(): Bitmap? {
         cachedWallpaper?.let { return it }
 
         val wallpaperManager = WallpaperManager.getInstance(context)
 
-        // Try 1: Get actual wallpaper (WallpaperManager requires READ_EXTERNAL_STORAGE specifically)
-        val hasReadExternal = ContextCompat.checkSelfPermission(
-            context, Manifest.permission.READ_EXTERNAL_STORAGE
-        ) == PackageManager.PERMISSION_GRANTED
-
-        if (hasReadExternal) {
-            try {
-                val drawable = wallpaperManager.drawable
-                if (drawable != null) {
-                    val bitmap = if (drawable is BitmapDrawable) {
-                        drawable.bitmap
-                    } else {
-                        val bmp = Bitmap.createBitmap(
-                            drawable.intrinsicWidth.coerceAtLeast(1),
-                            drawable.intrinsicHeight.coerceAtLeast(1),
-                            Bitmap.Config.ARGB_8888
-                        )
-                        val canvas = Canvas(bmp)
-                        drawable.setBounds(0, 0, canvas.width, canvas.height)
-                        drawable.draw(canvas)
-                        bmp
-                    }
-                    val scaled = Bitmap.createScaledBitmap(bitmap, screenWidth, screenHeight, true)
-                    cachedWallpaper = scaled
-                    Log.d(TAG, "Wallpaper loaded from drawable: ${scaled.width}x${scaled.height}")
-                    return scaled
-                }
-            } catch (e: SecurityException) {
-                Log.d(TAG, "Cannot access wallpaper directly (permission denied), trying WallpaperColors")
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to get wallpaper drawable", e)
-            }
-        } else {
-            Log.d(TAG, "Storage permission not granted, trying WallpaperColors fallback")
-        }
-
-        // Try 2: Use WallpaperColors API to create a matching gradient (Android 8.1+)
+        // Direct wallpaper bitmaps require privileged permissions on Android 13+,
+        // the app's minimum version. Use the public colors API instead.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
             try {
                 val colors: WallpaperColors? = wallpaperManager.getWallpaperColors(WallpaperManager.FLAG_SYSTEM)
@@ -498,7 +458,7 @@ class ScreenshotManager(
             }
         }
 
-        // Try 3: Default dark gradient
+        // Fallback: Default dark gradient
         val defaultGradient = createDefaultGradient()
         cachedWallpaper = defaultGradient
         Log.d(TAG, "Using default dark gradient")

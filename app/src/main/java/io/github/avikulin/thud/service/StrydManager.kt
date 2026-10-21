@@ -675,7 +675,12 @@ class StrydManager(
     private fun notifyConnected() {
         handler.post {
             state.strydConnected = true
-            val deviceName = connectedDevice?.name ?: "Stryd"
+            val deviceName = try {
+                connectedDevice?.name
+            } catch (e: SecurityException) {
+                Log.d(TAG, "Bluetooth name unavailable after permission revocation")
+                null
+            } ?: "Stryd"
             listener?.onStrydConnected(deviceName)
 
             statusText?.text = service.getString(R.string.foot_pod_connected)

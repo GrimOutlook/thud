@@ -655,7 +655,12 @@ class HrSensorManager(
             handler.post {
                 val deviceName = resolveDeviceName(gatt)
                 // Update saved name if BLE now provides the real name (fixes "HR Sensor" from earlier)
-                val bleName = gatt.device.name
+                val bleName = try {
+                    gatt.device.name
+                } catch (e: SecurityException) {
+                    Log.d(TAG, "[$mac] Bluetooth name unavailable after permission revocation")
+                    null
+                }
                 if (bleName != null) {
                     val prefs = service.getSharedPreferences(SettingsManager.PREFS_NAME, Context.MODE_PRIVATE)
                     val saved = SavedBluetoothDevices.getAll(prefs).firstOrNull { it.mac == mac }

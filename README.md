@@ -109,7 +109,7 @@ Both modes display the calibration chart with R², N statistics, and the regress
 
 ### Auto-Screenshot
 - Capture the full screenshot of the treadmill's screen
-- When taking a screen while watching Netflix or other DRM-protected content, the resulting black background is nicely replaced with the Home wallpaper
+- When taking a screen while watching Netflix or other DRM-protected content, the resulting black background is replaced with a gradient based on the Home wallpaper colors
 - Toggle screenshot mode with the camera button in HUD
 - Automatic screenshots on workout step transitions and pause
 - Screenshots saved to `Downloads/tHUD/<ProfileName>/screenshots/`
@@ -161,6 +161,51 @@ Your treadmill runs a locked-down Android system with iFIT/GlassOS. Before you c
 This process varies by treadmill model. Search for guides specific to your model, or ask an AI assistant for step-by-step instructions.
 
 ### Step 2: Set Up Android Development Tools
+
+#### Nix (Linux x86_64)
+
+The checked-in `flake.nix` and `flake.lock` provide a pinned development shell with
+JDK 17, Android platform 35, build-tools 36.0.0, ADB, and the Kotlin CLI. Nix must
+have the `nix-command` and `flakes` experimental features enabled. The shell accepts
+the Android SDK license and includes the proprietary SDK tools.
+
+From the repository root:
+
+```bash
+nix develop path:.
+bash gradlew --no-daemon clean build
+```
+
+Or build without entering an interactive shell:
+
+```bash
+nix develop path:. --command bash gradlew --no-daemon clean build
+```
+
+This builds debug and release APKs, runs Gradle unit tests, and runs Android lint.
+The first build requires network access for Nix packages, the pinned Gradle wrapper,
+and Maven dependencies. Use the wrapper rather than a separately installed Gradle.
+No Android Studio installation or `local.properties` is required; remove any stale
+`sdk.dir` override if it points to a different SDK. The shell sets the SDK/JDK paths
+and uses Nix's patched `aapt2` so resource compilation works on NixOS.
+
+Outputs:
+
+- Installable debug APK: `app/build/outputs/apk/debug/app-debug.apk`
+- Unsigned, optimized release APK: `app/build/outputs/apk/release/app-release-unsigned.apk`
+- Unit-test results: `app/build/reports/tests/testDebugUnitTest/index.html`
+- Lint report: `app/build/reports/lint-results-debug.html`
+
+The standalone hardware-free security checks can also run inside this shell:
+
+```bash
+bash tests/run-raw-command-tests.sh
+kotlinc app/src/main/java/io/github/avikulin/thud/service/ftms/FtmsControlAuthorization.kt \
+  tests/ftms/FtmsControlAuthorizationTest.kt -include-runtime -d /tmp/ftms-tests.jar
+java -jar /tmp/ftms-tests.jar
+```
+
+#### Android Studio / existing SDK
 
 You'll need [Android SDK](https://developer.android.com/studio) to build and install tHUD. The easiest way is to install Android Studio, which includes everything you need.
 
